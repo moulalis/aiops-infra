@@ -37,6 +37,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
+
+import requests
 
 
 class Colors:
@@ -450,10 +453,27 @@ def execute_step(step_name: str, state_file: Path, state: dict) -> tuple[bool, b
         print(f"{Colors.YELLOW}  Jira:    {jira_key}{Colors.END}")
     print()
 
+    # Set env vars for re-onboard mode
+    re_onboard_info = state.get("re_onboard")
+    if re_onboard_info:
+        os.environ["RE_ONBOARD"] = "1"
+        re_onboard_count = state.get("re_onboard_count", 1)
+        if step_name in ("rbc_release", "rbc_main"):
+            os.environ["RE_ONBOARD_BRANCH_SUFFIX"] = f"-re-{re_onboard_count}"
+            os.environ["RBC_REBASE_ONTO_LATEST"] = "0"
+        if step_name == "rbc_main":
+            os.environ["RBC_REPLACE_EXISTING_CATALOG"] = "1"
+            os.environ["RBC_REPLACE_EXISTING_TEKTON"] = "1"
+
     # Build command
     cmd = ["uv", "run", "--script", str(script_dir / config["script"]), previous_version, new_version]
     if step_name == "konflux":
         cmd.extend(["--repo-dir", repo_dir])
+        if re_onboard_info:
+            cmd.append("--re-onboard")
+            step_re = re_onboard_info.get("konflux", {})
+            if step_re.get("mr_state") == "open" and step_re.get("branch"):
+                cmd.extend(["--branch", step_re["branch"]])
     if dry_run:
         cmd.append("--dry-run")
 
@@ -521,6 +541,83 @@ def cleanup_repos(repo_dir: str) -> None:
             exit_code, _ = run_command(["rm", "-rf", str(repo_path)], f"Remove {repo}")
             if exit_code == 0:
                 print_success(f"Removed {repo}/")
+
+
+def check_github_pr_state(pr_url: str) -> dict:
+    """Check the state of a GitHub PR. Returns {"state": "open"|"merged"|"closed", "head_branch": "..."}."""
+    match = re.search(r'github\.com/([^/]+/[^/]+)/pull/(\d+)', pr_url)
+    if not match:
+        return {"state": "unknown", "head_branch": ""}
+    repo, pr_number = match.group(1), match.group(2)
+    token = os.environ.get("GITHUB_TOKEN", "")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        state = "merged" if data.get("merged") else data.get("state", "unknown")
+        return {"state": state, "head_branch": data.get("head", {}).get("ref", "")}
+    except Exception as e:
+        print_error(f"Could not check PR state for {pr_url}: {e}")
+        return {"state": "unknown", "head_branch": ""}
+
+
+def check_gitlab_mr_state(mr_url: str) -> dict:
+    """Check the state of a GitLab MR. Returns {"state": "open"|"merged"|"closed", "source_branch": "..."}."""
+    match = re.search(r'gitlab\.[^/]+/(.+?)/-/merge_requests/(\d+)', mr_url)
+    if not match:
+        return {"state": "unknown", "source_branch": ""}
+    project_path, mr_iid = match.group(1), match.group(2)
+    token = os.environ.get("KONFLUX_REPO_TOKEN", "")
+    encoded_project = quote(project_path, safe="")
+    host = re.search(r'(gitlab\.[^/]+)', mr_url)
+    gitlab_host = host.group(1) if host else "gitlab.cee.redhat.com"
+    headers = {"PRIVATE-TOKEN": token}
+    url = f"https://{gitlab_host}/api/v4/projects/{encoded_project}/merge_requests/{mr_iid}"
+    try:
+        r = requests.get(url, headers=headers, timeout=30, verify=False)
+        r.raise_for_status()
+        data = r.json()
+        state = data.get("state", "unknown")
+        if state == "opened":
+            state = "open"
+        return {"state": state, "source_branch": data.get("source_branch", "")}
+    except Exception as e:
+        print_error(f"Could not check MR state for {mr_url}: {e}")
+        return {"state": "unknown", "source_branch": ""}
+
+
+def prepare_re_onboard(state: dict) -> dict:
+    """Check PR/MR states for all completed steps and build re-onboard info."""
+    re_onboard_info = {}
+
+    # Check RBC Release PR
+    rbc_release_url = state["steps"]["rbc_release"].get("pr_url")
+    if rbc_release_url and rbc_release_url != "N/A":
+        pr_state = check_github_pr_state(rbc_release_url)
+        re_onboard_info["rbc_release"] = {"pr_state": pr_state["state"], "branch": pr_state["head_branch"]}
+        print_info(f"RBC Release PR: {pr_state['state']} (branch: {pr_state['head_branch']})")
+
+    # Check RBC Main PR
+    rbc_main_url = state["steps"]["rbc_main"].get("pr_url")
+    if rbc_main_url and rbc_main_url != "N/A":
+        pr_state = check_github_pr_state(rbc_main_url)
+        re_onboard_info["rbc_main"] = {"pr_state": pr_state["state"], "branch": pr_state["head_branch"]}
+        print_info(f"RBC Main PR: {pr_state['state']} (branch: {pr_state['head_branch']})")
+
+    # Check Konflux MR
+    konflux_url = state["steps"]["konflux"].get("mr_url")
+    if konflux_url and konflux_url != "N/A":
+        mr_state = check_gitlab_mr_state(konflux_url)
+        re_onboard_info["konflux"] = {"mr_state": mr_state["state"], "branch": mr_state["source_branch"]}
+        print_info(f"Konflux MR: {mr_state['state']} (branch: {mr_state['source_branch']})")
+
+    return re_onboard_info
 
 
 def finalize_pipeline(state_file: Path, state: dict) -> None:
@@ -637,11 +734,46 @@ def main():
     parser.add_argument("--resume", metavar="STATE_FILE", help="Resume from existing state file")
     parser.add_argument("--single-step", action="store_true",
                         help="Run at most one pending step then exit (for agent-driven progress display)")
+    parser.add_argument("--re-onboard", action="store_true",
+                        help="Re-onboard: re-run all steps, reusing Jira, creating new PRs/MRs if merged or updating existing ones")
 
     args = parser.parse_args()
 
+    # Re-onboard mode
+    if args.re_onboard:
+        if not args.resume:
+            print_error("--re-onboard requires --resume with existing state file")
+            sys.exit(1)
+
+        state_file = Path(args.resume)
+        if not state_file.exists():
+            print_error(f"State file not found: {state_file}")
+            sys.exit(1)
+
+        state = load_state(state_file)
+        previous_version = state["release_info"]["previous_version"]
+        new_version = state["release_info"]["new_version"]
+
+        print_header(f"RE-ONBOARD: {previous_version} → {new_version}")
+        print_info("Checking existing PR/MR states...")
+
+        re_onboard_info = prepare_re_onboard(state)
+        state["re_onboard"] = re_onboard_info
+
+        # Track re-onboard count for unique branch naming
+        re_onboard_count = state.get("re_onboard_count", 0) + 1
+        state["re_onboard_count"] = re_onboard_count
+
+        # Reset all steps to pending
+        for step_name in state["steps"]:
+            state["steps"][step_name]["status"] = "pending"
+            state["steps"][step_name]["completed_at"] = None
+
+        save_state(state_file, state)
+        print_success(f"All steps reset to pending for re-onboard (iteration {re_onboard_count})")
+
     # Resume mode
-    if args.resume:
+    elif args.resume:
         state_file = Path(args.resume)
         if not state_file.exists():
             print_error(f"State file not found: {state_file}")
@@ -679,6 +811,8 @@ def main():
     print(f"{Colors.BOLD}║{Colors.END}  New version:      {Colors.GREEN}{state['release_info']['new_version']}{Colors.END}")
     if state['release_info']['dry_run']:
         print(f"{Colors.BOLD}║{Colors.END}  Mode:            {Colors.YELLOW}DRY-RUN{Colors.END}")
+    if state.get("re_onboard"):
+        print(f"{Colors.BOLD}║{Colors.END}  Mode:            {Colors.YELLOW}RE-ONBOARD{Colors.END}")
     print(f"{Colors.BOLD}╠══════════════════════════════════════════════════════════════╣{Colors.END}")
     print(f"{Colors.BOLD}║{Colors.END}  Pipeline Steps:")
     print(f"{Colors.BOLD}║{Colors.END}    1. RBC Release            → Create release branch (RBC)")

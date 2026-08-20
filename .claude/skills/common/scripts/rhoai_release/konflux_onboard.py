@@ -73,6 +73,16 @@ def parse_args():
         action="store_true",
         help="Perform all steps and show changes (git status + diff), but do not commit or push",
     )
+    parser.add_argument(
+        "--re-onboard",
+        action="store_true",
+        help="Re-onboard mode: overwrite existing files and optionally use an existing branch",
+    )
+    parser.add_argument(
+        "--branch",
+        default="",
+        help="Use this branch name instead of generating a new timestamp-based one (for re-onboard with open MR)",
+    )
     args = parser.parse_args()
 
     args.is_ea = is_ea_version(args.previous_version) or is_ea_version(args.new_version)
@@ -106,7 +116,16 @@ def main():
     try:
         clone_repo(repo_dir)
         ensure_latest_main(repo_dir)
-        branch_name = create_branch(repo_dir)
+
+        re_onboard = args.re_onboard or os.environ.get("RE_ONBOARD", "").strip().lower() in ("1", "true")
+        re_onboard_branch = args.branch or os.environ.get("RE_ONBOARD_BRANCH", "").strip()
+        if re_onboard:
+            os.environ["RE_ONBOARD"] = "1"
+
+        if re_onboard_branch:
+            branch_name = create_branch(repo_dir, branch_name=re_onboard_branch)
+        else:
+            branch_name = create_branch(repo_dir)
 
         new_tenant_dir = copy_version_directory(
             repo_dir,
@@ -183,6 +202,7 @@ def main():
                 branch_name,
                 paths_to_add=paths_to_add,
                 dry_run=False,
+                force_push=re_onboard and bool(re_onboard_branch),
             )
             mr_title = f"Add Konflux release configuration for RHOAI v{args.new_version}"
             mr_info = create_merge_request_safe(

@@ -140,6 +140,7 @@ def logical_and_staging_branches(argv2: str) -> tuple[str, str]:
 def resolved_automation_head_branch(logical_latest: str) -> str:
     """
     PR head branch: ``RBC_AUTOMATION_BRANCH_PREFIX`` + train without a leading ``rhoai-`` (e.g. ``automation-3.4``).
+    Appends ``RE_ONBOARD_BRANCH_SUFFIX`` when set (e.g. ``-re-1`` for first re-onboard).
     """
     p = constants.env_or_default(
         "RBC_AUTOMATION_BRANCH_PREFIX", constants.RBC_AUTOMATION_BRANCH_PREFIX
@@ -148,7 +149,8 @@ def resolved_automation_head_branch(logical_latest: str) -> str:
     m = re.match(r"^rhoai-", body, re.IGNORECASE)
     if m:
         body = body[len(m.group(0)) :]
-    return f"{p}{body}"
+    suffix = os.environ.get("RE_ONBOARD_BRANCH_SUFFIX", "")
+    return f"{p}{body}{suffix}"
 
 
 def skip_ci_from_env():
@@ -967,6 +969,27 @@ def github_pr_target_repo():
     return part.replace(".git", "").strip("/")
 
 
+def _find_existing_open_pr(head_branch: str, base_branch: str) -> Optional[str]:
+    """Check if an open PR already exists from head to base. Returns PR URL or None."""
+    repo = github_pr_target_repo()
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{repo}/pulls"
+    params = {"head": f"{repo.split('/')[0]}:{head_branch}", "base": base_branch, "state": "open"}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        prs = r.json()
+        if prs:
+            return prs[0].get("html_url")
+    except Exception as e:
+        print(f"WARNING: could not check for existing PR: {e}")
+    return None
+
+
 def create_pr(head_branch, base_branch):
     """head = automation branch (commits); base = merge target (default: logical ``argv[2]`` + staging suffix). Not swapped."""
     if head_branch == base_branch:
@@ -977,6 +1000,13 @@ def create_pr(head_branch, base_branch):
         sys.exit(1)
 
     repo = github_pr_target_repo()
+
+    existing_url = _find_existing_open_pr(head_branch, base_branch)
+    if existing_url:
+        print(f"PR already open (force-push updated it): {existing_url}")
+        print(f"PR: {existing_url}")
+        return
+
     print(
         f"Opening release PR on {repo}: head={head_branch!r} base={base_branch!r} "
         "(release-line branches; not the default main-branch onboarding flow)"
@@ -1019,6 +1049,10 @@ def create_pr(head_branch, base_branch):
     try:
         r.raise_for_status()
     except requests.HTTPError:
+        if r.status_code == 422 and "no commits" in r.text.lower():
+            print(f"No changes to merge — files already up to date on {base_branch}")
+            print("PR: N/A (no changes)")
+            return
         print("ERROR: GitHub API:", r.status_code, r.text)
         if r.status_code == 422 and "base" in r.text.lower():
             print(

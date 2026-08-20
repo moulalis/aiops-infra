@@ -85,7 +85,8 @@ def create_merge_request(
             }
         )
     except GitlabCreateError as e:
-        err = (getattr(e, "error_message", None) or str(e)).lower()
+        raw = getattr(e, "error_message", None) or str(e)
+        err = (raw if isinstance(raw, str) else " ".join(str(x) for x in raw)).lower()
         if "already exists" in err or getattr(e, "response_code", None) == 409:
             opened = project.mergerequests.list(source_branch=source_branch, state="opened")
             if opened:

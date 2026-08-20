@@ -103,13 +103,14 @@ def ensure_latest_main(repo_path: Path, branch: str = REPO_BRANCH) -> None:
     logger.info("Repository is at latest %s", branch)
 
 
-def create_branch(repo_path: Path) -> str:
+def create_branch(repo_path: Path, branch_name: str = "") -> str:
     """
-    Create a new unique branch: automation/rhoai-release-<timestamp>.
+    Create a new branch. If branch_name is empty, generates automation/rhoai-release-<timestamp>.
     Returns the branch name.
     """
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    branch_name = f"automation/rhoai-release-{timestamp}"
+    if not branch_name:
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        branch_name = f"automation/rhoai-release-{timestamp}"
     logger.info("Creating branch: %s", branch_name)
     if GITPYTHON_AVAILABLE:
         repo = Repo(repo_path)
@@ -149,6 +150,7 @@ def commit_and_push(
     branch_name: str,
     paths_to_add: Optional[List[str]] = None,
     dry_run: bool = False,
+    force_push: bool = False,
 ) -> None:
     """Commit changes and push branch to origin. If paths_to_add is set, only those paths are staged."""
     commit_message = f"Add Konflux release configuration for RHOAI v{new_version}"
@@ -193,7 +195,10 @@ def commit_and_push(
             # Use token in URL so push works in CI (avoids 'could not read Username')
             auth_url = REPO_URL.replace("https://", f"https://oauth2:{token}@", 1)
             origin.set_url(auth_url)
-            origin.push(branch_name)
+            if force_push:
+                origin.push(branch_name, force=True)
+            else:
+                origin.push(branch_name)
             logger.info("Pushed %s to origin", branch_name)
     else:
         if paths_to_add:
@@ -224,5 +229,6 @@ def commit_and_push(
             auth_url = REPO_URL.replace("https://", f"https://oauth2:{token}@", 1)
             run_git_cmd(repo_path, "remote", "set-url", "origin", auth_url)
             logger.info("Pushing branch to origin")
-            run_git_cmd(repo_path, "push", "-u", "origin", branch_name)
+            push_args = ["push", "--force", "-u", "origin", branch_name] if force_push else ["push", "-u", "origin", branch_name]
+            run_git_cmd(repo_path, *push_args)
             logger.info("Pushed %s to origin", branch_name)

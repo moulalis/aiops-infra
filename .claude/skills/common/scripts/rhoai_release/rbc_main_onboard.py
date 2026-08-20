@@ -433,7 +433,8 @@ def resolved_git_head_branch(logical: str) -> str:
         s = os.environ["RBC_BRANCH_SUFFIX"]
     else:
         s = constants.RBC_BRANCH_SUFFIX
-    return f"{p}{logical}{s}"
+    re_suffix = os.environ.get("RE_ONBOARD_BRANCH_SUFFIX", "")
+    return f"{p}{logical}{s}{re_suffix}"
 
 
 def fetch_ref(remote: str, branch: str) -> bool:
@@ -519,10 +520,38 @@ def commit_and_push(
         push_to_origin(head, force=True)
 
 
+def _find_existing_open_pr(head: str, base: str) -> str | None:
+    """Check if an open PR already exists from head to base. Returns PR URL or None."""
+    repo = github_pr_target_repo()
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{repo}/pulls"
+    params = {"head": f"{repo.split('/')[0]}:{head}", "base": base, "state": "open"}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        prs = r.json()
+        if prs:
+            return prs[0].get("html_url")
+    except Exception as e:
+        print(f"WARNING: could not check for existing PR: {e}")
+    return None
+
+
 def open_pr(head: str, base: str, prev: str, nxt: str) -> None:
     if head == base:
         print("ERROR: head == base")
         sys.exit(1)
+
+    existing_url = _find_existing_open_pr(head, base)
+    if existing_url:
+        print(f"PR already open (force-push updated it): {existing_url}")
+        print(f"PR: {existing_url}")
+        return
+
     repo = github_pr_target_repo()
     url = f"https://api.github.com/repos/{repo}/pulls"
     headers = {
@@ -547,6 +576,10 @@ def open_pr(head: str, base: str, prev: str, nxt: str) -> None:
     try:
         r.raise_for_status()
     except requests.HTTPError:
+        if r.status_code == 422 and "no commits" in r.text.lower():
+            print(f"No changes to merge — files already up to date on {base}")
+            print("PR: N/A (no changes)")
+            return
         print("GitHub API error:", r.status_code, r.text)
         sys.exit(1)
     print("PR:", r.json().get("html_url", ""))
